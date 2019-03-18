@@ -67,20 +67,91 @@ final class IndentationTypeFixer extends AbstractFixer implements WhitespacesAwa
     protected function applyFix(\SplFileInfo $file, Tokens $tokens)
     {
         $this->indent = $this->whitespacesConfig->getIndent();
+        
+        $sourceIndent = $this->inferSourceIndent($tokens);
 
         foreach ($tokens as $index => $token) {
             if ($token->isComment()) {
-                $tokens[$index] = $this->fixIndentInComment($tokens, $index);
+                $tokens[$index] = $this->fixIndentInComment($tokens, $index, $sourceIndent);
 
                 continue;
             }
 
             if ($token->isWhitespace()) {
-                $tokens[$index] = $this->fixIndentToken($tokens, $index);
+                $tokens[$index] = $this->fixIndentToken($tokens, $index, $sourceIndent);
 
                 continue;
             }
         }
+    }
+    
+    /**
+     * tries to infer indentation used in the source-file
+     *
+     * @param  Tokens $tokens
+     * @return string         the inferred indentation-sequence
+     */
+    private function inferSourceIndent(Tokens $tokens) 
+    {
+        // find indentation in code
+        $candidates = [];
+        $lengths = [];
+        $count = 0;
+    
+        foreach ($tokens as $token) {
+            if ($token->isWhitespace()) {
+                // get horizontal whitespace from this token
+                $content = $token->getContent();
+                
+                if (!Preg::match('/\R(\h+)/', $content, $matches)) {
+                    // not a new-line followed by horizontal space
+                    continue;
+                }
+                
+                $chars = $matches[1];
+                $length = strlen($chars); 
+                
+                // check if the indent-length differs from
+                // what we're already seen
+                if (in_array($length, $lengths, true)) {
+                    // ignore indent, same length already seen
+                    continue;
+                }
+                
+                $candidates[] = $chars;
+                $lengths[] = $length;
+                $count++;
+                
+                if ($count > 1) {
+                    // we have two different indent tokens,
+                    // it should be possible to infer the 
+                    // source indentation now
+                    break;
+                }           
+            }
+        }
+        
+        if ($count === 0) {
+            // not possible to infer, assume configured indent
+            return $this->indent;
+        }
+        
+        if ($count === 1) {
+            // only one token, use this as indent
+            return $candidates[0];
+        }
+        
+        $candidate0 = $candidates[0];
+        $candidate1 = $candidates[1];
+        
+        if (strpos($candidate0, "\t") !== false) {
+            // source probably uses "\t" for indentation
+            // check how many "\t" are used for one level (probably just one but you never know)
+            return str_repeat("\t", abs(substr_count($candidate0, "\t") - substr_count($candidate1, "\t")));
+        }
+        
+        // source probably uses spaces
+        return str_repeat(' ', abs(substr_count($candidate0, ' ') - substr_count($candidate1, ' ')));
     }
 
     /**
@@ -89,22 +160,18 @@ final class IndentationTypeFixer extends AbstractFixer implements WhitespacesAwa
      *
      * @return Token
      */
-    private function fixIndentInComment(Tokens $tokens, $index)
-    {
-        $content = Preg::replace('/^(?:(?<! ) {1,3})?\t/m', '\1    ', $tokens[$index]->getContent(), -1, $count);
-
-        // Also check for more tabs.
-        while (0 !== $count) {
-            $content = Preg::replace('/^(\ +)?\t/m', '\1    ', $content, -1, $count);
-        }
-
+    private function fixIndentInComment(Tokens $tokens, $index, $sourceIndent)
+    {        
         $indent = $this->indent;
-
-        // change indent to expected one
-        $content = Preg::replaceCallback('/^(?:    )+/m', static function ($matches) use ($indent) {
-            return str_replace('    ', $indent, $matches[0]);
-        }, $content);
-
+        
+        $content = Preg::replaceCallback(
+            '/^(\h+)/m', 
+            static function ($matches) use($indent, $sourceIndent) {
+                return str_replace($sourceIndent, $indent, $matches[1]);
+            },
+            $tokens[$index]->getContent()
+        );
+        
         return new Token([$tokens[$index]->getId(), $content]);
     }
 
@@ -114,7 +181,7 @@ final class IndentationTypeFixer extends AbstractFixer implements WhitespacesAwa
      *
      * @return Token
      */
-    private function fixIndentToken(Tokens $tokens, $index)
+    private function fixIndentToken(Tokens $tokens, $index, $sourceIndent)
     {
         $content = $tokens[$index]->getContent();
         $previousTokenHasTrailingLinebreak = false;
@@ -126,14 +193,21 @@ final class IndentationTypeFixer extends AbstractFixer implements WhitespacesAwa
         }
 
         $indent = $this->indent;
+        
+        $sourceUsesTabs = strpos($sourceIndent, "\t") !== false;
+        $configWantsTabs = strpos($indent, "\t") !== false;
+        
+        if ($sourceUsesTabs && $configWantsTabs) {
+            // don't bother ... it is not possible to
+            // correct mixed spaces and tabs in this scenario
+            return $tokens[$index];
+        }
+        
         $newContent = Preg::replaceCallback(
             '/(\R)(\h+)/', // find indent
-            static function (array $matches) use ($indent) {
-                // normalize mixed indent
-                $content = Preg::replace('/(?:(?<! ) {1,3})?\t/', '    ', $matches[2]);
-
-                // change indent to expected one
-                return $matches[1].str_replace('    ', $indent, $content);
+            static function (array $matches) use ($indent, $sourceIndent) {
+                // replace source-indent with configured indent
+                return $matches[1].str_replace($sourceIndent, $indent, $matches[2]);
             },
             $content
         );
